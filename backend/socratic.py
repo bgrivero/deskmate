@@ -1,4 +1,5 @@
 from langchain_openai import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings
 
 from langchain_core.chat_history import InMemoryChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
@@ -7,9 +8,16 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 llm = ChatOpenAI(
     base_url="http://127.0.0.1:1234/v1",
     api_key="lm-studio",
-    model="gpt-3.5-turbo",
+    model="qwen3.5-2b",
     temperature=0.5,
     max_completion_tokens=500
+)
+
+embedder = OpenAIEmbeddings(
+    base_url="http://127.0.0.1:1234/v1",
+    api_key="lm-studio",
+    model="text-embedding-embeddinggemma-300m-qat",
+    check_embedding_ctx_length=False
 )
 
 prompt = ChatPromptTemplate.from_messages([
@@ -44,3 +52,8 @@ def test_multiturn():
             config={"configurable": {"session_id": "default"}}
         )
         print(response.content)
+
+def get_embeddings(text):
+    embeddings = embedder.embed_query(text)
+    return embeddings
+
