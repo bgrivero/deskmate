@@ -1,8 +1,9 @@
-import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import register_uuid
 import os
 from dotenv import load_dotenv
+import psycopg
+from langchain_postgres import PostgresChatMessageHistory
 
 load_dotenv()
 
@@ -58,6 +59,10 @@ def create_tables():
         curs.close()
     except:
         raise ConnectionError("Could not instantiate table.")
+
+    sync_connection = psycopg.connect(f"postgresql://postgres:{DB_PASS}@localhost:5432/postgres")
+    PostgresChatMessageHistory.create_tables(sync_connection, "chat_history")
+    sync_connection.close()
 
 # we use a context manager to scope the cursor session
 # with conn.cursor() as curs:

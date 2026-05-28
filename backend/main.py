@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 import datetime
 import uuid
 
-from socratic import conversation, store, get_embeddings
+from socratic import chain, get_history, get_embeddings
 from db import get_db, create_tables, connection_pool
 
 class ChatRequest(BaseModel):
@@ -27,11 +27,12 @@ async def chat(request: ChatRequest,
     curs = conn.cursor()
     input_message = request.message
     session_id = request.session_id
-
-    response = conversation.invoke(
-            {"input": input_message},
-            config={"configurable": {"session_id": session_id}}
-    )
+    
+    history = get_history(session_id, conn)
+    response = chain.invoke({
+        "input": input_message,
+        "history": history
+    })
     output_message = response.content
     request_embedding = get_embeddings(request.message)
     response_embedding = get_embeddings(output_message)

@@ -1,9 +1,10 @@
 from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
 
-from langchain_core.chat_history import InMemoryChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.messages import HumanMessage, AIMessage
+from db import DB_PASS
+import psycopg
 
 llm = ChatOpenAI(
     base_url="http://127.0.0.1:1234/v1",
@@ -29,29 +30,27 @@ prompt = ChatPromptTemplate.from_messages([
 
 chain = prompt | llm
 
+sync_connection = psycopg.connect(f"postgresql://postgres:{DB_PASS}@localhost:5432/postgres")
+
 store = {}
-def get_session_history(session_id: str):
+
+def get_history(session_id: str, conn):
     if session_id not in store:
-        store[session_id] = InMemoryChatMessageHistory()
-    return store[session_id]
-
-conversation = RunnableWithMessageHistory(
-    chain,
-    get_session_history,
-    input_messages_key="input",
-    history_messages_key="history"
-)
-
-def test_multiturn():
-    while True:
-        user_input = input("You: ")
-        if user_input == "exit()":
-            break
-        response = conversation.invoke(
-            {"input": user_input},
-            config={"configurable": {"session_id": "default"}}
+        # seed from DB only once per server lifetime
+        curs = conn.cursor()
+        curs.execute(
+            "SELECT role, content FROM messages WHERE session_id = %s ORDER BY created_at ASC",
+            (session_id,)
         )
-        print(response.content)
+        messages = []
+        for role, content in curs.fetchall():
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            else:
+                messages.append(AIMessage(content=content))
+        store[session_id] = messages
+        curs.close()
+    return store[session_id]
 
 def get_embeddings(text):
     embeddings = embedder.embed_query(text)
