@@ -30,13 +30,10 @@ prompt = ChatPromptTemplate.from_messages([
 
 chain = prompt | llm
 
-sync_connection = psycopg.connect(f"postgresql://postgres:{DB_PASS}@localhost:5432/postgres")
-
 store = {}
 
 def get_history(session_id: str, conn):
     if session_id not in store:
-        # seed from DB only once per server lifetime
         curs = conn.cursor()
         curs.execute(
             "SELECT role, content FROM messages WHERE session_id = %s ORDER BY created_at ASC",

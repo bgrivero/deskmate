@@ -55,15 +55,35 @@ def create_tables():
             session_id UUID NOT NULL REFERENCES sessions(id)
             );
         """)
+
+        curs.execute("""
+        CREATE TABLE IF NOT EXISTS document_chunks(
+            upload_id SERIAL PRIMARY KEY,
+            filename TEXT,
+            chunk_text TEXT,
+            embedding VECTOR(768),
+            session_id UUID NOT NULL REFERENCES sessions(id)
+            );
+        """)
         conn.commit()
         curs.close()
     except:
         raise ConnectionError("Could not instantiate table.")
 
-    sync_connection = psycopg.connect(f"postgresql://postgres:{DB_PASS}@localhost:5432/postgres")
-    PostgresChatMessageHistory.create_tables(sync_connection, "chat_history")
-    sync_connection.close()
-
+def find_similar_chunks(conn, input_embedding, session_id, top_k = 20):
+    curs = conn.cursor()
+    curs.execute("""
+    SELECT chunk_text 
+    FROM document_chunks
+    WHERE session_id = %s
+    ORDER BY embedding <-> %s 
+    LIMIT %s;
+    """, (session_id, str(input_embedding), top_k))
+    results = curs.fetchall()
+    curs.close()
+    return [row[0] for row in results]
+    
+    
 # we use a context manager to scope the cursor session
 # with conn.cursor() as curs:
 
