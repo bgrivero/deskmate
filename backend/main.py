@@ -9,17 +9,12 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.messages import HumanMessage, AIMessage
 
-from socratic import chain, get_history, get_embeddings, store
+from langchain import BaseChat, SocracticChat
 from db import get_db, create_tables, connection_pool, find_similar_chunks
+from models import ChatRequest, UploadRequest, SearchRequest
 
-class ChatRequest(BaseModel):
-    message: str
-    session_id: str = "default"
-    use_rag: bool = False
-
-class UploadRequest(BaseModel):
-    filepath: str
-    session_id: str = "default"
+base_chat = BaseChat()
+socratic_chat = SocracticChat()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -29,6 +24,9 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+###################################
+# Base Chat Functionality
+###################################
 @app.post("/chat")
 async def chat(request: ChatRequest, 
                conn=Depends(get_db)):
@@ -36,24 +34,24 @@ async def chat(request: ChatRequest,
     input_message = request.message
     query_message = request.message
     session_id = request.session_id
-    request_embedding = get_embeddings(request.message)
-    history = get_history(session_id, conn)
+    request_embedding = base_chat.get_embeddings(request.message)
+    history = base_chat.get_history(session_id, conn)
 
     if request.use_rag:
         similar_chunks = find_similar_chunks(conn, request_embedding, session_id)
         context = "\n\n".join(similar_chunks)
         query_message = f"Context from notes:\n{context}\n\nQuestion: {input_message}"
 
-    response = chain.invoke({
+    response = base_chat.chain.invoke({
         "input": query_message,
         "history": history
     })
     
     output_message = response.content
-    store[session_id].append(HumanMessage(content=input_message))
-    store[session_id].append(AIMessage(content=output_message))
+    base_chat.store[session_id].append(HumanMessage(content=input_message))
+    base_chat.store[session_id].append(AIMessage(content=output_message))
     
-    response_embedding = get_embeddings(output_message)
+    response_embedding = base_chat.get_embeddings(output_message)
     curs.execute("""
     INSERT INTO messages (role, content, embedding, created_at, session_id)
     VALUES 
@@ -119,7 +117,7 @@ async def upload_document(upload_request: UploadRequest,
     title = document_chunked[0].metadata["title"]
     for chunk in document_chunked:
         chunk_text = chunk.page_content
-        embedding = str(get_embeddings(chunk_text))
+        embedding = str(base_chat.get_embeddings(chunk_text))
         curs.execute("""
         INSERT INTO document_chunks (filename, chunk_text, embedding, session_id)
         VALUES (%s, %s, %s, %s)
@@ -128,3 +126,86 @@ async def upload_document(upload_request: UploadRequest,
     return {"uploaded_filename": title, "session_id":upload_request.session_id}
 
 
+###################################
+# Socratic Chat Functionality
+###################################
+@app.post("/socratic/chat")
+async def socratic(request: ChatRequest, 
+                        conn=Depends(get_db)):
+    curs = conn.cursor()
+    input_message = request.message
+    query_message = request.message
+    session_id = request.session_id
+    request_embedding = socratic_chat.get_embeddings(request.message)
+    history = socratic_chat.get_history(session_id, conn)
+
+    if request.use_rag:
+        similar_chunks = find_similar_chunks(conn, request_embedding, session_id)
+        context = "\n\n".join(similar_chunks)
+        query_message = f"Context from notes:\n{context}\n\nQuestion: {input_message}"
+
+    response = socratic_chat.chain.invoke({
+        "input": query_message,
+        "history": history
+    })
+    
+    output_message = response.content
+    socratic_chat.store[session_id].append(HumanMessage(content=input_message))
+    socratic_chat.store[session_id].append(AIMessage(content=output_message))
+    
+    response_embedding = socratic_chat.get_embeddings(output_message)
+    curs.execute("""
+    INSERT INTO messages (role, content, embedding, created_at, session_id)
+    VALUES 
+    (%s, %s, %s, %s, %s),
+    (%s, %s, %s, %s, %s)
+    """, (
+        'user', input_message, str(request_embedding), datetime.datetime.now(), session_id,
+        'assistant', output_message, str(response_embedding), datetime.datetime.now(), session_id
+    ))
+    curs.close()
+    
+    return {"message": output_message, "session_id": session_id}
+
+
+###################################
+# Search Messages Functionality
+###################################
+@app.post("/search")
+async def search_messages(request: SearchRequest,
+                          conn=Depends(get_db)):
+    curs = conn.cursor()
+    search_query = request.search_query
+    request_embedding = base_chat.get_embeddings(request.search_query)
+    ## Temporarily limits to top 10 search results, will add pagination in the future
+    if request.keyword_toggle:
+        curs.execute("""
+        SELECT sessions.id, sessions.title, sessions.created_at, messages.content, messages.created_at
+        FROM messages
+        JOIN sessions ON messages.session_id = sessions.id 
+        WHERE messages.content LIKE %s
+        ORDER BY messages.embedding <-> %s 
+        LIMIT 10;
+        """, (f'%%{search_query}%%', str(request_embedding)))
+        results = curs.fetchall()
+        curs.close()
+    else:
+        curs.execute("""
+        SELECT sessions.id, sessions.title, sessions.created_at, messages.content, messages.created_at
+        FROM messages
+        JOIN sessions ON messages.session_id = sessions.id 
+        ORDER BY messages.embedding <-> %s 
+        LIMIT 10;
+        """, (str(request_embedding), ))
+        results = curs.fetchall()
+        curs.close()
+
+    return [{
+        "session_id": row[0],
+        "session_title": row[1],
+        "session_created_at": row[2],
+        "content": row[3],
+        "message_created_at": row[4]
+    }
+    for row in results
+    ]
