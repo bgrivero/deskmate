@@ -52,6 +52,7 @@ def create_tables():
             content TEXT NOT NULL,
             embedding VECTOR(768),
             created_at TIMESTAMP DEFAULT NOW(),
+            mode TEXT,
             session_id UUID NOT NULL REFERENCES sessions(id)
             );
         """)
@@ -65,6 +66,31 @@ def create_tables():
             session_id UUID NOT NULL REFERENCES sessions(id)
             );
         """)
+
+        curs.execute("""
+        CREATE TABLE IF NOT EXISTS topics(
+            topic_id SERIAL PRIMARY KEY,
+            title TEXT,
+            created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+
+        curs.execute("""
+        CREATE TABLE IF NOT EXISTS topic_blocks(
+            block_id SERIAL PRIMARY KEY,
+            title TEXT,
+            note_content TEXT,
+            note_embedding VECTOR(768),
+            sot_attention TEXT,
+            sot_intentionality TEXT,
+            sot_difficulty TEXT,
+            sot_emotion TEXT,
+            sot_content TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            topic_id INT NOT NULL REFERENCES topics(topic_id)
+            );
+        """)
+
         conn.commit()
         curs.close()
     except:
@@ -82,7 +108,18 @@ def find_similar_chunks(conn, input_embedding, session_id, top_k = 20):
     results = curs.fetchall()
     curs.close()
     return [row[0] for row in results]
-    
+
+def find_similar_notes(conn, input_embedding, top_k = 20):
+    curs = conn.cursor()
+    curs.execute("""
+    SELECT note_content 
+    FROM topic_blocks
+    ORDER BY note_embedding <-> %s 
+    LIMIT %s;
+    """, (str(input_embedding), top_k))
+    results = curs.fetchall()
+    curs.close()
+    return [row[0] for row in results]
     
 # we use a context manager to scope the cursor session
 # with conn.cursor() as curs:
