@@ -91,6 +91,21 @@ def create_tables():
             );
         """)
 
+        curs.execute("""
+        CREATE TABLE IF NOT EXISTS block_scores(
+            score_id SERIAL PRIMARY KEY,   
+            attention_score INT,
+            intentionality_score INT,
+            emotions JSONB,
+            thought_type TEXT,
+            temporal_orientation TEXT,
+            thought_quality TEXT,
+            reasoning TEXT,
+            created_at TIMESTAMP DEFAULT NOW(),
+            block_id INT NOT NULL REFERENCES topic_blocks(block_id)
+            );
+        """)
+
         conn.commit()
         curs.close()
     except:

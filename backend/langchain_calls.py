@@ -1,8 +1,10 @@
 from langchain_openai import ChatOpenAI
 from langchain_openai import OpenAIEmbeddings
-
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.messages import HumanMessage, AIMessage
+
+from prompts import BASE_CHAT_PROMPT, SOCRATIC_CHAT_PROMPT, SCORING_SYSTEM_PROMPT, INSIGHT_SYSTEM_PROMPT
+
 
 class BaseChat():
     def __init__(self, llm=None, embedder=None):
@@ -24,9 +26,7 @@ class BaseChat():
             check_embedding_ctx_length=False
             )
         self.prompt_template = ChatPromptTemplate.from_messages([
-            ("system","""You are a general student studying assistant. Respond to student
-             inquiries in a gentle and respectful manner. If you decide you do not have sufficient
-             context, mention it."""),
+            ("system",BASE_CHAT_PROMPT),
             MessagesPlaceholder(variable_name='history'),
             ("human","{input}")
         ])
@@ -59,11 +59,30 @@ class SocracticChat(BaseChat):
     def __init__(self, llm=None, embedder=None):
         super().__init__(llm, embedder)
         self.prompt_template = ChatPromptTemplate.from_messages([
-        ("system","""You are a student studying assistant. You will help students through the
-        Socractic method. You will ask the student questions about a topic based on their 
-        understanding, and you will identify gaps in their explanations."""),
+        ("system",SOCRATIC_CHAT_PROMPT),
         MessagesPlaceholder(variable_name='history'),
         ("human","{input}")
         ])
         self.chain = self.prompt_template | self.llm
+
+
+class ScorerChat(BaseChat):
+    def __init__(self, llm=None, embedder=None):
+        super().__init__(llm, embedder)
+        self.prompt_template = ChatPromptTemplate.from_messages([
+        ("system",SCORING_SYSTEM_PROMPT),
+        ("human","{input}")
+        ])
+        self.chain = self.prompt_template | self.llm
         
+
+class InsightChat(BaseChat):
+    def __init__(self, llm=None, embedder=None):
+        super().__init__(llm, embedder)
+        self.prompt_template = ChatPromptTemplate.from_messages([
+        ("system",INSIGHT_SYSTEM_PROMPT),
+        ("human","{input}")
+        ])
+        self.chain = self.prompt_template | self.llm
+
+

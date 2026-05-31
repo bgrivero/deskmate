@@ -8,13 +8,17 @@ import uuid
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.messages import HumanMessage, AIMessage
+import json
+import re
 
-from langchain import BaseChat, SocracticChat
+from langchain_calls import BaseChat, SocracticChat, ScorerChat, InsightChat
 from db import get_db, create_tables, connection_pool, find_similar_chunks, find_similar_notes
-from models import ChatRequest, UploadRequest, SearchRequest, TopicBlockRequest
+from models import ChatRequest, UploadRequest, SearchRequest, TopicBlockRequest, AnalyticsRequest
 
 base_chat = BaseChat()
 socratic_chat = SocracticChat()
+scorer_chat = ScorerChat()
+insight_chat = InsightChat()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -66,7 +70,7 @@ async def chat(request: ChatRequest,
     ))
     curs.close()
     
-    return {"message": output_message, "session_id": session_id}
+    return {"message": output_message, "session_id": session_id, "query": query_message}
 
 @app.post("/session")
 async def new_chat(title: Annotated[str, Query(max_length=50)], 
@@ -82,6 +86,22 @@ async def new_chat(title: Annotated[str, Query(max_length=50)],
     ))
     curs.close()
     return {"session_id": str(session_id)}
+
+@app.get("/session")
+async def get_all_sessions(conn=Depends(get_db)):
+    curs = conn.cursor()
+    curs.execute("""
+    SELECT id, title, created_at
+    FROM sessions
+    ORDER BY created_at DESC
+    """)
+    results = curs.fetchall()
+    curs.close()
+    return [{
+        "session_id": row[0],
+        "title": row[1],
+        "created_at": row[2]
+    } for row in results]
 
 @app.post("/upload/{session_id}")
 async def upload_document(upload_request: UploadRequest,
@@ -357,3 +377,260 @@ async def search_topic_blocks(request: SearchRequest,
         "created_at": row[7]
     }
     for row in results]
+
+
+###################################
+# Analytics Functionality
+###################################
+
+@app.post("/analytics/score/{block_id}")
+async def score_block(block_id: int,
+                      conn=Depends(get_db)):
+    curs = conn.cursor()
+    curs.execute("""
+    SELECT title, note_content, 
+            sot_attention, sot_intentionality, sot_difficulty, sot_content,
+            sot_emotion, created_at
+    FROM topic_blocks
+    WHERE block_id = (%s)
+    """, (block_id, ))
+    result = curs.fetchone()
+    request_query = f"""
+    block_id: {block_id}
+    title: {result[0]}
+    note_content: {result[1]}
+    sot_attention: {result[2]}
+    sot_intentionality: {result[3]}
+    sot_difficulty: {result[4]}
+    sot_content: {result[5]}
+    sot_emotion: {result[6]}
+    """
+    response = scorer_chat.chain.invoke({"input": request_query})
+    raw = response.content
+    clean = re.sub(r'```json|```', '', raw).strip()
+    try:
+        data = json.loads(clean)
+        scores = data["block_scores"][0]  
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Model returned invalid JSON")
+    
+    curs.execute("""
+    INSERT INTO block_scores (block_id, attention_score, intentionality_score, 
+                emotions, thought_type, temporal_orientation, thought_quality, reasoning)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+    RETURNING *
+    """, (
+        block_id,
+        scores["attention_score"],
+        scores["intentionality_score"],
+        json.dumps(scores["emotions"]), 
+        scores["thought_type"],
+        scores["temporal_orientation"],
+        scores["thought_quality"],
+        scores["reasoning"]
+    ))
+    inserted = curs.fetchone()
+    curs.close()
+    return {
+        "score_id": inserted[0],
+        "block_id": inserted[1],
+        "attention_score": inserted[2],
+        "intentionality_score": inserted[3],
+        "emotions": inserted[4],
+        "thought_type": inserted[5],
+        "temporal_orientation": inserted[6],
+        "thought_quality": inserted[7],
+        "reasoning": inserted[8]
+    }
+
+@app.get("/analytics/score/{block_id}")
+async def get_block_score(block_id: int,
+                      conn=Depends(get_db)):
+    curs = conn.cursor()
+    curs.execute("""
+    SELECT  attention_score, intentionality_score, 
+            emotions, thought_type, temporal_orientation, thought_quality, reasoning
+    FROM block_scores
+    WHERE block_id = (%s)
+    """, (block_id, ))
+    result = curs.fetchone()
+    
+    return {
+        "attention_score": result[0],
+        "intentionality_score": result[1],
+        "emotions": result[2],
+        "thought_type": result[3],
+        "temporal_orientation": result[4],
+        "thought_quality": result[5],
+        "reasoning": result[6]
+    }
+
+
+@app.post("/analytics")
+async def get_analytics(request: AnalyticsRequest,
+                        conn=Depends(get_db)):
+    curs = conn.cursor()
+
+    query = """
+    SELECT block_id, title, note_content,
+           sot_attention, sot_intentionality, sot_difficulty,
+           sot_content, sot_emotion, created_at
+    FROM topic_blocks 
+    WHERE 1=1
+    """
+    # FILTER BLOCKS BASED ON REQUEST
+    params = []
+    if request.topic_ids:
+        query += " AND topic_id = ANY(%s)"
+        params.append(request.topic_ids)
+    if request.date_from:
+        query += " AND created_at >= %s"
+        params.append(request.date_from)
+    if request.date_to:
+        query += " AND created_at <= %s"
+        params.append(request.date_to)
+    query += " ORDER BY created_at ASC"
+    curs.execute(query, params)
+    blocks = curs.fetchall()
+
+    if not blocks:
+        raise HTTPException(status_code=404, detail="No blocks found for the given scope")
+
+    all_scores = []
+    blocks_to_score = []
+
+    # CHECKS IF REQUESTED BLOCKS FOR ANALYSIS HAVE ALREADY BEEN SCORED. 
+    # IF NO (e.g. blocks_to_score is Not None), THEN REQUEST A SCORE.
+    for block in blocks:
+        block_id = block[0]
+        curs.execute("SELECT attention_score, intentionality_score, emotions, thought_type, temporal_orientation, thought_quality, reasoning FROM block_scores WHERE block_id = %s", (block_id,))
+        cached = curs.fetchone()
+        if cached:
+            all_scores.append({
+                "block_id": block_id,
+                "block_title": block[1],
+                "attention_score": cached[0],
+                "intentionality_score": cached[1],
+                "emotions": cached[2],
+                "thought_type": cached[3],
+                "temporal_orientation": cached[4],
+                "thought_quality": cached[5],
+                "reasoning": cached[6],
+                "difficulty": block[5],
+                "created_at": str(block[8])
+            })
+        else:
+            blocks_to_score.append(block)
+
+    if blocks_to_score:
+        batch_query = "\n\n".join([
+            f"block_id: {b[0]}\ntitle: {b[1]}\nnote_content: {b[2]}\nsot_attention: {b[3]}\nsot_intentionality: {b[4]}\nsot_difficulty: {b[5]}\nsot_content: {b[6]}\nsot_emotion: {b[7]}"
+            for b in blocks_to_score
+        ])
+        response = scorer_chat.chain.invoke({"input": batch_query})
+        raw = response.content
+        clean = re.sub(r'```json|```', '', raw).strip()
+        try:
+            scored_data = json.loads(clean)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=500, detail="Model returned invalid JSON during scoring")
+
+        for scored in scored_data["block_scores"]:
+            curs.execute("""
+            INSERT INTO block_scores (block_id, attention_score, intentionality_score,
+                        emotions, thought_type, temporal_orientation, thought_quality, reasoning)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                scored["block_id"],
+                scored["attention_score"],
+                scored["intentionality_score"],
+                json.dumps(scored["emotions"]),
+                scored["thought_type"],
+                scored["temporal_orientation"],
+                scored["thought_quality"],
+                scored["reasoning"]
+            ))
+            original = next(b for b in blocks_to_score if b[0] == scored["block_id"])
+            all_scores.append({
+                **scored,
+                "difficulty": original[5],
+                "created_at": str(original[8])
+            })
+
+    # COMPUTE REQUESTED METRICS
+    result = {"block_scores": all_scores}
+
+    if "attention_trend" in request.metrics:
+        result["attention_trend"] = [
+            {"block_title": s["block_title"], "attention_score": s["attention_score"], "created_at": s["created_at"]}
+            for s in all_scores
+        ]
+
+    if "emotion_pattern" in request.metrics:
+        emotion_keys = ["anxiety", "curiosity", "frustration", "boredom", "confidence", "motivation"]
+        result["emotion_pattern"] = {
+            emotion: round(sum(s["emotions"][emotion] for s in all_scores) / len(all_scores), 2)
+            for emotion in emotion_keys
+        }
+
+    if "difficulty_correlation" in request.metrics:
+        result["difficulty_correlation"] = [
+            {"block_title": s["block_title"], "difficulty": int(s["difficulty"]), "attention_score": s["attention_score"]}
+            for s in all_scores
+        ]
+
+    if "intentionality_profile" in request.metrics:
+        result["intentionality_profile"] = [
+            {"block_title": s["block_title"], "intentionality_score": s["intentionality_score"], "thought_type": s["thought_type"]}
+            for s in all_scores
+        ]
+
+    if "drift_ratio" in request.metrics:
+        total = len(all_scores)
+        spontaneous = sum(1 for s in all_scores if s["thought_type"] == "spontaneous")
+        result["drift_ratio"] = {
+            "spontaneous": spontaneous,
+            "deliberate": total - spontaneous,
+            "ratio": round(spontaneous / total, 2)
+        }
+
+    if "temporal_bias" in request.metrics:
+        orientations = ["future", "past", "present"]
+        result["temporal_bias"] = {
+            o: sum(1 for s in all_scores if s["temporal_orientation"] == o)
+            for o in orientations
+        }
+
+    if "progression" in request.metrics:
+        result["progression"] = [
+            {"block_title": s["block_title"], "attention_score": s["attention_score"], "intentionality_score": s["intentionality_score"], "created_at": s["created_at"]}
+            for s in all_scores
+        ]
+
+    if "time_of_day_pattern" in request.metrics:
+        result["time_of_day_pattern"] = [
+            {"block_title": s["block_title"], "attention_score": s["attention_score"], "created_at": s["created_at"]}
+            for s in all_scores
+        ]
+
+    # LLM CALL FOR QUALITATIVE METRICS
+    needs_llm = any(m in request.metrics for m in ["sticking_points", "interventions", "summary"])
+    if needs_llm:
+        insight_query = json.dumps({"block_scores": all_scores})
+        insight_response = insight_chat.chain.invoke({"input": insight_query})
+        raw_insight = insight_response.content
+        clean_insight = re.sub(r'```json|```', '', raw_insight).strip()
+        try:
+            insight_data = json.loads(clean_insight)
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=500, detail="Model returned invalid JSON during insight generation")
+
+        if "sticking_points" in request.metrics:
+            result["sticking_points"] = insight_data.get("sticking_points", [])
+        if "interventions" in request.metrics:
+            result["interventions"] = insight_data.get("interventions", [])
+        if "summary" in request.metrics:
+            result["summary"] = insight_data.get("summary", "")
+
+    curs.close()
+    return result
